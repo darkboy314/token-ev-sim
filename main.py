@@ -44,7 +44,7 @@ class Params:
         self.tau_max = {"L": 500.0, "H": 2000.0}
  
         # Nested logit
-        self.theta = 1.0               # token-nest dissimilarity
+        self.theta = 1/50000.0               # token-nest dissimilarity
  
         # User classes  (example: 3 heterogeneous classes)
         # g = 0,1,2
@@ -55,7 +55,7 @@ class Params:
         self.beta_VOT = np.array([100.0, 115.0, 120.0])    # $/h should be within 122 to 120
         self.Dg = np.array([0.25, 0.30, 0.35])             # travel/detour (h)
         self.pg_O = np.array([0.20, 0.20, 0.20])           # outside price ($/kWh), use 3 same number
-        self.Gamma_O = np.array([50.0, 80.0, 120.0])       # inconvenience of outside ($/yr)
+        self.Gamma_O = np.array([5000.0, 8000.0, 12000.0])       # inconvenience of outside ($/yr)
         self.Z = {"L": 30.0, "H": 80.0}                    # net token-adjustment term
  
         # Service time per class (hours)
@@ -65,29 +65,26 @@ class Params:
 # ============================================================
 # 2. Erlang-C waiting time (multi-server queue)
 # ============================================================
-# ERROR
-def erlang_c_wait(lam: float, mu: float, c: int) -> float:
+def erlang_c(A:float, N:int) -> float:
     """
-    Expected waiting time in queue (Erlang-C) for c servers.
-    Returns infinity if unstable.
+    Compute the Erlang C formula for waiting probability.
+    A: traffic intensity (arrival rate / service rate)
+    N: number of servers
+    Returns the probability that an arriving customer has to wait.
     """
-    if c <= 0 or mu <= 0:
-        return np.inf
-    rho = lam / (c * mu)
-    if rho >= 1.0 - 1e-9:
-        return np.inf
- 
-    # Poisson probabilities (stable computation)
-    a = lam / mu
-    # P0
-    sum_term = sum(a**k / factorial(k) for k in range(c))
-    last = a**c / (factorial(c) * (1 - rho))
-    P0 = 1.0 / (sum_term + last)
-    # Probability of waiting
-    C = last * P0
-    Wq = C / (c * mu - lam)
-    return max(Wq, 0.0)
- 
+    if N <= 0:
+        return 1.0  # All customers wait if no servers
+    if A >= N:
+        return 1.0  # System is unstable, all customers wait
+
+    # Compute P0 (probability that there are 0 customers in the system)
+    sum_terms = sum((A**k) / factorial(k) for k in range(N))
+    last_term = (A**N) / (factorial(N) * (1 - A/N))
+    P0 = 1.0 / (sum_terms + last_term)
+
+    # Probability that an arriving customer has to wait
+    C = last_term * P0
+    return C
  
 # ============================================================
 # 3. Lower-level nested-logit SUE
@@ -103,9 +100,9 @@ def compute_SUE(z: Dict, p: Params, max_iter: int = 200, tol: float = 1e-5
     """
     n_g = len(p.G)
     # indices: 0=O, 1=N, 2=L, 3=H
-    x = np.zeros((n_g, 4))
-    # initial guess: all outside
-    x[:, 0] = p.Mg.copy()
+
+    # initial population distribution
+    x = np.repeat((p.Mg[:, np.newaxis] / 4), 4, axis=1)
  
     k = {"N": z["kN"], "L": z["kL"], "H": z["kH"]}
     K = sum(k.values())
@@ -129,16 +126,17 @@ def compute_SUE(z: Dict, p: Params, max_iter: int = 200, tol: float = 1e-5
             s_bar[j] = num / den
             mu[j] = 1.0 / s_bar[j] if s_bar[j] > 0 else 1e6
  
-        # --- waiting times (Erlang-C) ---
+        # --- waiting times (Erlang-C) ---     
         W = {}
         for j in ["N", "L", "H"]:
             c = max(int(round(k[j])), 0)
-            W[j] = erlang_c_wait(lam[j], mu[j], c)      # TO BE CONFIRM
- 
+            W[j] = erlang_c(lam[j] / mu[j], c)  # waiting time in hours
+        
         # stability soft check
-        for j in ["N", "L", "H"]:
-            if lam[j] >= k[j] * mu[j] - p.eps_mu:
-                W[j] = 1e3   # large penalty
+        # should be on the upper level
+        # for j in ["N", "L", "H"]:
+            # if lam[j] >= k[j] * mu[j] - p.eps_mu:
+                # W[j] = 1e3   # large penalty
  
         # --- operating profit ---
         Pi_op = (z["p"] - p.ce - p.cv) * sum(E.values()) - p.cm_coeff * K
@@ -173,26 +171,25 @@ def compute_SUE(z: Dict, p: Params, max_iter: int = 200, tol: float = 1e-5
  
         # --- nested logit probabilities ---
         # token nest inclusive value
-        I_T = np.zeros(n_g)
+        I_gT = np.zeros(n_g)  # token nest inclusive value
         for g in range(n_g):
-            I_T[g] = (1.0 / p.theta) * np.log(
+            I_gT[g] = (1.0 / p.theta) * np.log(
                 np.exp(p.theta * V[g, 2]) + np.exp(p.theta * V[g, 3]) + 1e-30
             )
- 
+            
         # top-level probabilities (O, N, T)
-        # ?????
-        I_top = np.stack([V[:, 0], V[:, 1], I_T], axis=1)
-        exp_I = np.exp(I_top - I_top.max(axis=1, keepdims=True))
+        c = 1/100000.0  # for numerical stability
+        I_g = np.stack([V[:, 0], V[:, 1], I_gT], axis=1) * c
+        exp_I = np.exp(I_g)
         P_top = exp_I / exp_I.sum(axis=1, keepdims=True)
-        # ????? END ?????
  
         # conditional token probabilities
         P_t_given_T = np.zeros((n_g, 2))  # L, H
         for g in range(n_g):
             eL = np.exp(p.theta * V[g, 2])
             eH = np.exp(p.theta * V[g, 3])
-            P_t_given_T[g, 0] = eL / (eL + eH + 1e-30)
-            P_t_given_T[g, 1] = eH / (eL + eH + 1e-30)
+            P_t_given_T[g, 0] = eL / (eL + eH)
+            P_t_given_T[g, 1] = eH / (eL + eH)
  
         # full choice probabilities
         P = np.zeros((n_g, 4))
@@ -323,7 +320,7 @@ if __name__ == "__main__":
  
     # ----- Quick evaluation of a hand-crafted decision -----
     z0 = {
-        "kN": 8, "kL": 6, "kH": 4,
+        "kN": 80, "kL": 80, "kH": 80,
         "p": 0.28,
         "tauL": 180.0, "tauH": 650.0,
         "qL": 250.0, "qH": 80.0,
@@ -371,7 +368,7 @@ if __name__ == "__main__":
         evaluate,
         bounds,
         args=(p,),
-        popsize=12,
+        popsize=100,
         mutation=0.7,
         recombination=0.5,
         seed=42,
