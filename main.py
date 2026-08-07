@@ -7,6 +7,7 @@ import numpy as np
 from scipy.special import factorial
 from scipy.optimize import minimize, differential_evolution
 from typing import Dict, Tuple, Optional
+from sklearn.preprocessing import MinMaxScaler
 import warnings
 warnings.filterwarnings("ignore")
  
@@ -35,25 +36,25 @@ class Params:
         self.alpha_bar = 0.7           # upper bound on α
         self.eps_mu = 1e-3             # queue stability margin
         self.eps_F = 1000.0            # financing buffer
-        self.B_bar = 100000.0          # max extra fundraising
+        self.B_bar = 1e10          # max extra fundraising
         self.eps_Pi = 1000.0           # min operating profit
  
         # Price bounds
         self.p_min, self.p_max = 0.15, 0.45
-        self.tau_min = {"L": 50.0, "H": 200.0}
-        self.tau_max = {"L": 500.0, "H": 2000.0}
+        self.tau_min = {"L": 50.0, "H": 20.0}
+        self.tau_max = {"L": 5000000.0, "H": 2000000.0}
  
         # Nested logit
-        self.theta = 1/50000.0               # token-nest dissimilarity
+        self.theta = 1             # token-nest dissimilarity
  
         # User classes  (example: 3 heterogeneous classes)
         # g = 0,1,2
         self.G = [0, 1, 2]                                 # index of the group
-        self.Mg = np.array([800.0, 600.0, 400.0])          # population
-        self.fg = np.array([120.0, 150.0, 180.0])          # annual sessions
+        self.Mg = np.array([8000.0, 6000.0, 4000.0])          # population
+        self.fg = np.array([120.0, 100.0, 80.0])          # annual sessions
         self.eg = np.array([25.0, 35.0, 45.0])             # kWh per session
         self.beta_VOT = np.array([100.0, 115.0, 120.0])    # $/h should be within 122 to 120
-        self.Dg = np.array([0.25, 0.30, 0.35])             # travel/detour (h)
+        self.Dg = np.array([0.30, 0.30, 0.30])             # travel/detour (h)
         self.pg_O = np.array([0.20, 0.20, 0.20])           # outside price ($/kWh), use 3 same number
         self.Gamma_O = np.array([5000.0, 8000.0, 12000.0])       # inconvenience of outside ($/yr)
         self.Z = {"L": 30.0, "H": 80.0}                    # net token-adjustment term
@@ -93,7 +94,7 @@ def compute_SUE(z: Dict, p: Params, max_iter: int = 200, tol: float = 1e-5
                 ) -> Tuple[np.ndarray, Dict]:
     """
     Solve the nested-logit SUE for a given developer decision z.
-    z keys: kN, kL, kH, p, tauL, tauH, qL, qH, alpha
+    z keys: kN, kL, kH, p, tauL, tauH, alpha
     Returns:
         x : shape (n_g, 4)  columns = [O, N, L, H]
         info : diagnostics (waiting times, profits, utilities, ...)
@@ -102,6 +103,7 @@ def compute_SUE(z: Dict, p: Params, max_iter: int = 200, tol: float = 1e-5
     # indices: 0=O, 1=N, 2=L, 3=H
 
     # initial population distribution
+    # dimension 1 for group, dimention 2 for choice (O, N, L, H)
     x = np.repeat((p.Mg[:, np.newaxis] / 4), 4, axis=1)
  
     k = {"N": z["kN"], "L": z["kL"], "H": z["kH"]}
@@ -134,15 +136,15 @@ def compute_SUE(z: Dict, p: Params, max_iter: int = 200, tol: float = 1e-5
         
         # stability soft check
         # should be on the upper level
-        # for j in ["N", "L", "H"]:
-            # if lam[j] >= k[j] * mu[j] - p.eps_mu:
-                # W[j] = 1e3   # large penalty
+        for j in ["N", "L", "H"]:
+            if lam[j] >= k[j] * mu[j] - p.eps_mu:
+                W[j] = 1e3   # large penalty
  
         # --- operating profit ---
         Pi_op = (z["p"] - p.ce - p.cv) * sum(E.values()) - p.cm_coeff * K
  
         # --- profit-sharing returns (present value) ---
-        qL, qH = max(z["qL"], 1e-6), max(z["qH"], 1e-6)
+        qL, qH = x[:, 2].sum(), x[:, 3].sum()
         denom = p.omega["L"] * qL + p.omega["H"] * qH
         R_hat = {}
         for t in ["L", "H"]:
@@ -168,27 +170,29 @@ def compute_SUE(z: Dict, p: Params, max_iter: int = 200, tol: float = 1e-5
                     - (z[f"tau{t}"] + p.Ay * p.fg[g] * p.eg[g] * z["p"])
                     - p.Ay * p.beta_VOT[g] * (p.fg[g] * W[t] + p.fg[g] * p.Dg[g])
                 )
+                
+        scaler = MinMaxScaler()
+        V_scaled = scaler.fit_transform(V)
  
         # --- nested logit probabilities ---
         # token nest inclusive value
         I_gT = np.zeros(n_g)  # token nest inclusive value
         for g in range(n_g):
             I_gT[g] = (1.0 / p.theta) * np.log(
-                np.exp(p.theta * V[g, 2]) + np.exp(p.theta * V[g, 3]) + 1e-30
+                np.exp(p.theta * V_scaled[g, 2]) + np.exp(p.theta * V_scaled[g, 3])
             )
             
         # top-level probabilities (O, N, T)
-        c = 1/100000.0  # for numerical stability
-        I_g = np.stack([V[:, 0], V[:, 1], I_gT], axis=1) * c
+        I_g = np.stack([V_scaled[:, 0], V_scaled[:, 1], I_gT], axis=1) * c
         exp_I = np.exp(I_g)
         P_top = exp_I / exp_I.sum(axis=1, keepdims=True)
  
         # conditional token probabilities
         P_t_given_T = np.zeros((n_g, 2))  # L, H
         for g in range(n_g):
-            eL = np.exp(p.theta * V[g, 2])
-            eH = np.exp(p.theta * V[g, 3])
-            P_t_given_T[g, 0] = eL / (eL + eH)
+            eL = np.exp(p.theta * V_scaled[g, 2])
+            eH = np.exp(p.theta * V_scaled[g, 3])
+            P_t_given_T[g, 0] = eL / (eL + eH) 
             P_t_given_T[g, 1] = eH / (eL + eH)
  
         # full choice probabilities
@@ -203,7 +207,7 @@ def compute_SUE(z: Dict, p: Params, max_iter: int = 200, tol: float = 1e-5
  
         # enforce token quantity consistency (soft projection)
         # (hard enforcement is done via constraint in upper level)
-        if abs(x[:, 2].sum() - z["qL"]) > 1e-3 or abs(x[:, 3].sum() - z["qH"]) > 1e-3:
+        if abs(x[:, 2].sum() - qL) > 1e-3 or abs(x[:, 3].sum() - qH) > 1e-3:
             # optional mild scaling; usually left to upper-level constraint
             pass
  
@@ -231,18 +235,20 @@ def compute_SUE(z: Dict, p: Params, max_iter: int = 200, tol: float = 1e-5
 # ============================================================
 def developer_profit(z: Dict, x: np.ndarray, info: Dict, p: Params) -> float:
     """Equation (1) of the paper."""
+    qL, qH = x[:, 2].sum(), x[:, 3].sum()
     K = z["kN"] + z["kL"] + z["kH"]
     C_K = p.C_per_charger * K
-    token_revenue = z["tauL"] * z["qL"] + z["tauH"] * z["qH"]
+    token_revenue = z["tauL"] * qL + z["tauH"] * qH
     Pi_D = (1 - z["alpha"]) * info["Pi_op"] * p.Ay + (token_revenue - C_K - p.B0)
     return Pi_D
  
  
 def check_constraints(z: Dict, x: np.ndarray, info: Dict, p: Params) -> Dict[str, bool]:
     """Return a dictionary of constraint satisfaction flags."""
+    qL, qH = x[:, 2].sum(), x[:, 3].sum()
     K = z["kN"] + z["kL"] + z["kH"]
     C_K = p.C_per_charger * K
-    token_rev = z["tauL"] * z["qL"] + z["tauH"] * z["qH"]
+    token_rev = z["tauL"] * qL + z["tauH"] * qH
  
     cons = {}
     # priority structure
@@ -254,15 +260,28 @@ def check_constraints(z: Dict, x: np.ndarray, info: Dict, p: Params) -> Dict[str
         for j in ["N", "L", "H"]
     )
     # token quantities match participation
-    cons["token_qty"] = (abs(x[:, 2].sum() - z["qL"]) < 1.0 and
-                         abs(x[:, 3].sum() - z["qH"]) < 1.0)
+    # cons["token_qty"] = (abs(x[:, 2].sum() - z["qL"]) < 1.0 and
+    #                      abs(x[:, 3].sum() - z["qH"]) < 1.0)
     # financing
     cons["fin_min"] = token_rev >= C_K + p.B0 + p.eps_F
     cons["fin_max"] = token_rev <= C_K + p.B0 + p.B_bar
     # positive operating profit
     cons["op_profit"] = info["Pi_op"] >= p.eps_Pi
+    # total charger count
+    # cons["K_total"] = (z["kN"] + z["kL"] + z["kH"] == K)
     # bounds already handled by variable ranges
-    return cons
+    
+    cons_value = {}
+    cons_value["priority1"] = info["W"]["H"] - info["W"]["L"]
+    cons_value["priority2"] = info["W"]["L"] - info["W"]["N"]
+    cons_value["stability_N"] = z["kN"] * info["mu"]["N"] - info["lam"]["N"]
+    cons_value["stability_L"] = z["kL"] * info["mu"]["L"] - info["lam"]["L"]
+    cons_value["stability_H"] = z["kH"] * info["mu"]["H"] - info["lam"]["H"]
+    cons_value["fin_min"] = token_rev - (C_K + p.B0 + p.eps_F)
+    cons_value["fin_max"] = (C_K + p.B0 + p.B_bar   ) - token_rev
+    cons_value["op_profit"] = info["Pi_op"] - p.eps_Pi  
+    
+    return cons, cons_value
  
  
 # ============================================================
@@ -272,7 +291,7 @@ def evaluate(z_vec: np.ndarray, p: Params, return_detail: bool = False):
     """
     Wrapper that turns a flat continuous vector into z, solves SUE,
     returns negative profit (for minimisers) and constraint violations.
-    z_vec = [kN, kL, kH, p, tauL, tauH, qL, qH, alpha]
+    z_vec = [kN, kL, kH, p, tauL, tauH, alpha]
     """
     z = {
         "kN": max(0, z_vec[0]),
@@ -281,9 +300,9 @@ def evaluate(z_vec: np.ndarray, p: Params, return_detail: bool = False):
         "p":  np.clip(z_vec[3], p.p_min, p.p_max),
         "tauL": np.clip(z_vec[4], p.tau_min["L"], p.tau_max["L"]),
         "tauH": np.clip(z_vec[5], p.tau_min["H"], p.tau_max["H"]),
-        "qL": max(0, z_vec[6]),
-        "qH": max(0, z_vec[7]),
-        "alpha": np.clip(z_vec[8], 0.0, p.alpha_bar),
+        # "qL": max(0, z_vec[6]),
+        # "qH": max(0, z_vec[7]),
+        "alpha": np.clip(z_vec[6], 0.0, p.alpha_bar),
     }
     # round charger numbers for evaluation
     z["kN"] = int(round(z["kN"]))
@@ -292,7 +311,7 @@ def evaluate(z_vec: np.ndarray, p: Params, return_detail: bool = False):
  
     x, info = compute_SUE(z, p)
     profit = developer_profit(z, x, info, p)
-    cons = check_constraints(z, x, info, p)
+    cons, cons_value = check_constraints(z, x, info, p)
  
     # simple penalty for violated constraints
     penalty = 0.0
@@ -300,9 +319,9 @@ def evaluate(z_vec: np.ndarray, p: Params, return_detail: bool = False):
         penalty += 1e5
     if not cons["stability"]:
         penalty += 1e5
-    if not cons["token_qty"]:
-        # soft: encourage q ≈ participation
-        penalty += 100 * (abs(x[:, 2].sum() - z["qL"]) + abs(x[:, 3].sum() - z["qH"]))
+    # if not cons["token_qty"]:
+    #     # soft: encourage q ≈ participation
+    #     penalty += 100 * (abs(x[:, 2].sum() - z["qL"]) + abs(x[:, 3].sum() - z["qH"]))
     if not cons["fin_min"]:
         penalty += 1e4
     if not cons["fin_max"]:
@@ -311,7 +330,7 @@ def evaluate(z_vec: np.ndarray, p: Params, return_detail: bool = False):
         penalty += 1e4
  
     if return_detail:
-        return -profit + penalty, z, x, info, cons
+        return -profit + penalty, z, x, info, cons, cons_value
     return -profit + penalty
  
  
@@ -323,12 +342,12 @@ if __name__ == "__main__":
         "kN": 80, "kL": 80, "kH": 80,
         "p": 0.28,
         "tauL": 180.0, "tauH": 650.0,
-        "qL": 250.0, "qH": 80.0,
+        # "qL": 250.0, "qH": 80.0,
         "alpha": 0.45,
     }
     x, info = compute_SUE(z0, p)
     profit = developer_profit(z0, x, info, p)
-    cons = check_constraints(z0, x, info, p)
+    cons, cons_value = check_constraints(z0, x, info, p)
  
     print("=" * 60)
     print("Hand-crafted decision evaluation")
@@ -352,14 +371,14 @@ if __name__ == "__main__":
     print("=" * 60)
  
     bounds = [
-        (0, 30),          # kN
-        (0, 20),          # kL
-        (0, 15),          # kH
+        (0, 300),          # kN
+        (0, 200),          # kL
+        (0, 150),          # kH
         (p.p_min, p.p_max),
         (p.tau_min["L"], p.tau_max["L"]),
         (p.tau_min["H"], p.tau_max["H"]),
-        (0, 800),         # qL
-        (0, 400),         # qH
+        # (0, 800),         # qL
+        # (0, 400),         # qH
         (0.0, p.alpha_bar),
     ]
  
@@ -368,8 +387,8 @@ if __name__ == "__main__":
         evaluate,
         bounds,
         args=(p,),
-        popsize=100,
-        mutation=0.7,
+        popsize=50,
+        mutation=0.5,
         recombination=0.5,
         seed=42,
         workers=1,
@@ -378,11 +397,21 @@ if __name__ == "__main__":
         maxiter=40,          # increase for production runs
     )
  
-    obj, z_opt, x_opt, info_opt, cons_opt = evaluate(res.x, p, return_detail=True)
+    obj, z_opt, x_opt, info_opt, cons_opt, cons_value_opt = evaluate(res.x, p, return_detail=True)
     print(f"Optimised developer profit: ${-obj:,.0f}")
     print("Optimal (rounded) decision:")
     for k, v in z_opt.items():
         print(f"  {k:6s}: {v}")
+    print(f"Optimal participation (total) O/N/L/H: "
+          f"{x_opt[:,0].sum():.0f} / {x_opt[:,1].sum():.0f} / "
+          f"{x_opt[:,2].sum():.0f} / {x_opt[:,3].sum():.0f}")
+    print(f"lambda (arrival rates) N/L/H: {info_opt['lam']['N']:.3f} / "
+          f"{info_opt['lam']['L']:.3f} / {info_opt['lam']['H']:.3f}")
+    print(f"mu (service rates) N/L/H: {info_opt['mu']['N']:.3f} / "
+          f"{info_opt['mu']['L']:.3f} / {info_opt['mu']['H']:.3f}")
     print("Constraint satisfaction at optimum:")
     for k, v in cons_opt.items():
+        print(f"  {k:12s}: {v}")
+    print("Constraint values at optimum:")
+    for k, v in cons_value_opt.items():
         print(f"  {k:12s}: {v}")
